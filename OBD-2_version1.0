@@ -1,0 +1,587 @@
+"""
+OBD-2 System - ELM327 Communication & Diagnostic Module
+
+Provides a complete interface for talking to an OBD-II vehicle via ELM327
+(or compatible adapter/simulator) over serial. Supports ISO 15765-4 (CAN),
+PID requests, DTC read/clear, and a live data streamer for UI integration.
+
+Dependencies: pyserial (pip install pyserial)
+"""
+
+from __future__ import annotations
+
+import re
+import time
+import threading
+from enum import Enum
+from typing import Optional, Callable, Dict, Any, List, Iterator
+from dataclasses import dataclass, field
+
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    serial = None  # type: ignore
+
+
+# =============================================================================
+# Step 1: The Communication Interface (Serial Layer)
+# =============================================================================
+
+class SerialConnection:
+    """
+    Establishes and manages the raw serial connection to ELM327 hardware.
+    Handles send/receive with timing and timeout so the rest of the stack
+    never blocks indefinitely.
+    """
+
+    DEFAULT_BAUDRATE = 38400
+    DEFAULT_TIMEOUT_SEC = 5.0
+    READ_INTERVAL_SEC = 0.05
+    ELM_LINE_TERMINATOR = b"\r"
+    ELM_PROMPT = ">"
+
+    def __init__(
+        self,
+        port: Optional[str] = None,
+        baudrate: int = DEFAULT_BAUDRATE,
+        timeout_sec: float = DEFAULT_TIMEOUT_SEC,
+    ) -> None:
+        if serial is None:
+            raise RuntimeError("pyserial is required. Install with: pip install pyserial")
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout_sec = timeout_sec
+        self._serial: Optional[serial.Serial] = None
+
+    def connect(self, port: Optional[str] = None) -> bool:
+        """Open the serial port. Uses self.port if port is not given."""
+        target = port or self.port
+        if not target:
+            raise ValueError("No port specified. Provide port in constructor or connect(port=...)")
+        try:
+            self._serial = serial.Serial(
+                port=target,
+                baudrate=self.baudrate,
+                timeout=0.1,
+                write_timeout=1.0,
+            )
+            self.port = target
+            return True
+        except Exception:
+            return False
+
+    def disconnect(self) -> None:
+        """Close the serial connection."""
+        if self._serial and self._serial.is_open:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+            self._serial = None
+
+    @property
+    def is_connected(self) -> bool:
+        return self._serial is not None and self._serial.is_open
+
+    def send(self, command: str) -> None:
+        """Send a single line to the adapter. Appends CR."""
+        if not self._serial or not self._serial.is_open:
+            raise RuntimeError("Serial port is not open")
+        line = command.strip()
+        if not line.endswith("\r"):
+            line += "\r"
+        self._serial.write(line.encode("ascii"))
+        self._serial.flush()
+
+    def receive(self) -> str:
+        """
+        Read response until prompt or timeout.
+        Returns the full response text (multiple lines) with prompt stripped.
+        """
+        if not self._serial or not self._serial.is_open:
+            raise RuntimeError("Serial port is not open")
+        start = time.monotonic()
+        chunks: List[str] = []
+        while (time.monotonic() - start) < self.timeout_sec:
+            if self._serial.in_waiting:
+                data = self._serial.read(self._serial.in_waiting)
+                text = data.decode("ascii", errors="replace")
+                chunks.append(text)
+                if self.ELM_PROMPT in text:
+                    break
+            else:
+                time.sleep(self.READ_INTERVAL_SEC)
+        raw = "".join(chunks)
+        # Normalize: strip prompt and trailing CR/LF
+        raw = raw.replace(self.ELM_PROMPT, "").strip()
+        return raw
+
+    def send_and_receive(self, command: str) -> str:
+        """
+        Send a command and return the response. Handles raw timing of the
+        serial port and enforces timeout so the code does not hang if the
+        car or adapter stops responding.
+        """
+        self.send(command)
+        return self.receive()
+
+    @staticmethod
+    def list_ports() -> List[str]:
+        """Return a list of available serial port names (for UI/selection)."""
+        if serial is None:
+            return []
+        return [p.device for p in serial.tools.list_ports.comports()]
+
+
+# =============================================================================
+# Step 2: The Initialization Sequence (AT Command Set)
+# =============================================================================
+
+class Protocol(Enum):
+    """ELM327 protocol numbers. We target ISO 15765-4 CAN."""
+    AUTO = 0
+    SAE_J1850_PWM = 1
+    SAE_J1850_VPW = 2
+    ISO_9141_2 = 3
+    ISO_14230_4_KWP = 4
+    ISO_14230_4_KWP_FAST = 5
+    ISO_15765_4_CAN_11BIT_500K = 6
+    ISO_15765_4_CAN_29BIT_500K = 7
+    ISO_15765_4_CAN_11BIT_250K = 8
+    ISO_15765_4_CAN_29BIT_250K = 9
+
+
+def run_init_sequence(conn: SerialConnection, protocol: Protocol = Protocol.ISO_15765_4_CAN_11BIT_500K) -> bool:
+    """
+    Reset the chip, set protocol to ISO 15765-4 (CAN), and turn off
+    echo/spaces so responses are raw hex easier to parse.
+    """
+    def cmd(c: str) -> str:
+        return conn.send_and_receive(c)
+
+    # Reset to clear previous state
+    cmd("ATZ")
+    time.sleep(2.0)
+
+    # Echo off – we don't want the command echoed in the response
+    cmd("ATE0")
+    # Linefeeds off
+    cmd("ATL0")
+    # Spaces off – no spaces between hex bytes (e.g. "410C1234" instead of "41 0C 12 34")
+    cmd("ATS0")
+    # Headers off (optional; some adapters need headers on for CAN)
+    cmd("ATH0")
+    # Set protocol: 6 = ISO 15765-4 CAN 11 bit 500 kbaud
+    cmd(f"ATSP{protocol.value}")
+    # Allow long messages (multi-line)
+    cmd("ATAL")
+
+    # Quick sanity check
+    r = cmd("ATI")
+    if "ELM327" in r or "OBD" in r or r.strip():
+        return True
+    return True  # Still allow use if adapter doesn't echo ATI
+
+
+# =============================================================================
+# Step 3: The Request/Response Parser
+# =============================================================================
+
+def build_request(service_mode: str, pid: str) -> str:
+    """
+    Convert human-readable Service Mode and PID into the standard OBD request
+    format (hex string without spaces, as we use ATS0).
+    Example: service_mode "01", pid "0C" -> "010C"
+    """
+    sm = service_mode.strip().upper().replace(" ", "")
+    p = pid.strip().upper().replace(" ", "")
+    if not sm or not p:
+        raise ValueError("Service mode and PID must be non-empty")
+    # Allow "01" and "0C" or "1" and "C" style
+    if len(sm) == 1:
+        sm = "0" + sm
+    if len(p) == 1:
+        p = "0" + p
+    return sm + p
+
+
+def clean_response(response: str, expected_mode: Optional[str] = None) -> str:
+    """
+    Strip adapter/car header and the success byte "41" (for mode 01) from the
+    response to isolate the data bytes. Handles multi-line CAN responses.
+    """
+    # Flatten: remove newlines, spaces, and common prompt/artifacts
+    raw = response.replace("\r", "").replace("\n", "").replace(" ", "").upper()
+    # Keep only hex
+    raw = re.sub(r"[^0-9A-F]", "", raw)
+    if not raw:
+        return ""
+
+    # Find 41 XX YY ... (success response: 41 + mode + PID + data)
+    # For mode 01, success is 41. For mode 03, response is 43 + 3 bytes per DTC.
+    if expected_mode:
+        exp = expected_mode.strip().upper().replace(" ", "")
+        if len(exp) == 1:
+            exp = "0" + exp
+        success_byte = "4" + exp  # 41 for mode 01, 43 for mode 03, etc.
+    else:
+        success_byte = "41"
+
+    idx = raw.find(success_byte)
+    if idx != -1:
+        # Return from after success byte: e.g. "410C1234" -> "0C1234" (mode+PID+data)
+        return raw[idx + 2:]
+    # No 41/43; return whole hex string and let caller handle
+    return raw
+
+
+def parse_hex_bytes(hex_string: str) -> List[int]:
+    """Convert a continuous hex string into a list of byte values."""
+    hex_string = re.sub(r"[^0-9A-Fa-f]", "", hex_string)
+    if len(hex_string) % 2:
+        hex_string = "0" + hex_string
+    return [int(hex_string[i : i + 2], 16) for i in range(0, len(hex_string), 2)]
+
+
+# =============================================================================
+# Step 4: The Mathematical Transformation Engine
+# =============================================================================
+
+@dataclass
+class PIDFormula:
+    """Describes how to convert raw bytes (A, B, C, D) to a physical value."""
+    bytes_used: int  # 1, 2, or 4
+    formula: str    # "A-40", "(A*256+B)/4", etc. for documentation
+    unit: str
+
+
+# Standard OBD-II PID conversion formulas (Mode 01).
+# Formula implementations use A, B, C, D as first four data bytes after PID.
+def _formula_a_minus_40(a: int, _b: int, _c: int, _d: int) -> float:
+    return float(a - 40)
+
+
+def _formula_a_percent(a: int, _b: int, _c: int, _d: int) -> float:
+    return float(a * 100 / 255)
+
+
+def _formula_ab_div_4(a: int, b: int, _c: int, _d: int) -> float:
+    return ((a * 256) + b) / 4.0
+
+
+def _formula_ab_div_100(a: int, b: int, _c: int, _d: int) -> float:
+    return ((a * 256) + b) / 100.0
+
+
+def _formula_ab_times_0_01(a: int, b: int, _c: int, _d: int) -> float:
+    return ((a * 256) + b) * 0.01
+
+
+def _formula_ab_minus_40(a: int, b: int, _c: int, _d: int) -> float:
+    return ((a * 256) + b) / 100.0 - 40
+
+
+def _formula_ab(a: int, b: int, _c: int, _d: int) -> float:
+    return float((a << 8) | b)
+
+
+def _formula_a_times_0_1(a: int, _b: int, _c: int, _d: int) -> float:
+    return a * 0.1
+
+
+def _formula_abcd(a: int, b: int, c: int, d: int) -> float:
+    return (a << 24) | (b << 16) | (c << 8) | d
+
+
+# PID definitions: PID hex -> (bytes_used, conversion_fn, unit)
+PID_CONVERTERS: Dict[str, tuple[int, Callable[..., float], str]] = {
+    "04": (1, _formula_a_percent, "%"),   # Calculated engine load
+    "05": (1, _formula_a_minus_40, "°C"),   # Coolant temp
+    "0C": (2, _formula_ab_div_4, "rpm"),    # Engine RPM
+    "0D": (1, _formula_a_times_0_1, "km/h"), # Vehicle speed
+    "0F": (1, _formula_a_minus_40, "°C"),   # Intake air temp
+    "10": (2, _formula_ab_times_0_01, "g/s"), # MAF flow rate
+    "11": (1, _formula_a_percent, "%"),     # Throttle position
+    "2F": (1, _formula_a_percent, "%"),    # Fuel tank level
+    "33": (2, _formula_ab_div_100, "kPa"), # Barometric pressure
+    "42": (2, _formula_ab_div_100, "V"),   # Control module voltage
+    "43": (2, _formula_ab, "kPa"),         # Absolute load value
+    "44": (2, _formula_ab_times_0_01, "AFR"), # Commanded equiv ratio
+    "45": (1, _formula_a_percent, "%"),    # Relative throttle position
+    "46": (1, _formula_a_minus_40, "°C"),  # Ambient air temp
+    "47": (1, _formula_a_percent, "%"),    # Absolute throttle position B
+    "4C": (2, _formula_ab, ""),            # Commanded throttle actuator
+    "5C": (2, _formula_ab_minus_40, "°C"), # Engine oil temp
+}
+
+
+def convert_pid_value(pid: str, data_bytes: List[int]) -> Optional[float]:
+    """
+    Apply the conversion formula for the given PID to the data bytes.
+    data_bytes should be the payload only (after stripping 41 and mode+PID).
+    """
+    pid = pid.strip().upper().replace(" ", "")
+    if len(pid) == 1:
+        pid = "0" + pid
+    if pid not in PID_CONVERTERS:
+        return None
+    size, fn, _ = PID_CONVERTERS[pid]
+    # First 1–2 bytes after mode+PID in cleaned response are the PID echo, then data
+    # Clean response from clean_response() is "0C1234" for PID 0C -> data 12 34
+    if len(data_bytes) < size:
+        return None
+    a = data_bytes[0]
+    b = data_bytes[1] if size >= 2 else 0
+    c = data_bytes[2] if size >= 4 else 0
+    d = data_bytes[3] if size >= 4 else 0
+    return fn(a, b, c, d)
+
+
+def get_pid_unit(pid: str) -> str:
+    """Return the unit string for a PID (e.g. 'rpm', '°C')."""
+    pid = pid.strip().upper().replace(" ", "")
+    if len(pid) == 1:
+        pid = "0" + pid
+    if pid in PID_CONVERTERS:
+        return PID_CONVERTERS[pid][2]
+    return ""
+
+
+# =============================================================================
+# Step 5: The Diagnostic Logic (DTC Decoder)
+# =============================================================================
+
+DTC_LETTER_MAP = {
+    0: "P",  # Powertrain
+    1: "C",  # Chassis
+    2: "B",  # Body
+    3: "U",  # Network
+}
+
+
+def decode_dtc_bytes(b1: int, b2: int, b3: int) -> str:
+    """
+    Decode three bytes from Mode 03 response into a 5-digit DTC (e.g. P0123).
+    First nibble of first byte identifies P/C/B/U.
+    """
+    # DTC encoding: first byte high nibble = 0..3 -> P,C,B,U; then 4 hex digits
+    letter_idx = (b1 >> 4) & 0x03
+    letter = DTC_LETTER_MAP.get(letter_idx, "P")
+    d1 = (b1 >> 0) & 0x0F
+    d2 = (b2 >> 4) & 0x0F
+    d3 = (b2 >> 0) & 0x0F
+    d4 = (b3 >> 4) & 0x0F
+    d5 = (b3 >> 0) & 0x0F
+    return f"{letter}{d1}{d2}{d3}{d4}{d5}"
+
+
+def parse_dtc_response(hex_string: str) -> List[str]:
+    """
+    Parse Mode 03 response hex string into a list of DTC codes.
+    Expects cleaned hex (e.g. after stripping header and 43).
+    Format after "43": 2 bytes PID echo (e.g. 00 00 for PID 00), then 3 bytes per DTC.
+    """
+    bytes_list = parse_hex_bytes(hex_string)
+    # Skip first 2 bytes (PID echo)
+    i = 2
+    dtcs: List[str] = []
+    while i + 3 <= len(bytes_list):
+        dtcs.append(decode_dtc_bytes(bytes_list[i], bytes_list[i + 1], bytes_list[i + 2]))
+        i += 3
+    return dtcs
+
+
+# =============================================================================
+# Step 6: The SF Integration Layer – Single Class + Data Streamer
+# =============================================================================
+
+@dataclass
+class LivePIDValue:
+    """One live reading: PID, value, unit, raw hex."""
+    pid: str
+    value: Optional[float]
+    unit: str
+    raw_hex: str
+
+
+class OBD2System:
+    """
+    Single class that wraps serial connection, init, request/response parsing,
+    PID conversion, and DTC read/clear. Can be imported into the main
+    SpecForge (or other) project and used for live streaming to the UI.
+    """
+
+    def __init__(
+        self,
+        port: Optional[str] = None,
+        baudrate: int = 38400,
+        timeout_sec: float = 5.0,
+        protocol: Protocol = Protocol.ISO_15765_4_CAN_11BIT_500K,
+    ) -> None:
+        self._conn = SerialConnection(port=port, baudrate=baudrate, timeout_sec=timeout_sec)
+        self._protocol = protocol
+        self._initialized = False
+
+    def connect(self, port: Optional[str] = None) -> bool:
+        """Connect to the adapter and run the initialization sequence."""
+        if not self._conn.connect(port=port):
+            return False
+        self._initialized = run_init_sequence(self._conn, self._protocol)
+        return self._initialized
+
+    def disconnect(self) -> None:
+        self._conn.disconnect()
+        self._initialized = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self._conn.is_connected
+
+    def raw_send_receive(self, command: str) -> str:
+        """Low-level send and receive (for AT or custom OBD strings)."""
+        return self._conn.send_and_receive(command)
+
+    def request_pid(self, service_mode: str, pid: str) -> str:
+        """
+        Send a PID request and return the cleaned hex payload (no 41, no header).
+        """
+        req = build_request(service_mode, pid)
+        resp = self._conn.send_and_receive(req)
+        return clean_response(resp, expected_mode=service_mode)
+
+    def get_pid_value(self, service_mode: str, pid: str) -> Optional[LivePIDValue]:
+        """
+        Request a PID and return a LivePIDValue with converted value and unit.
+        """
+        hex_payload = self.request_pid(service_mode, pid)
+        if not hex_payload:
+            return LivePIDValue(pid=pid, value=None, unit=get_pid_unit(pid), raw_hex="")
+        data_bytes = parse_hex_bytes(hex_payload)
+        # Payload starts with echoed PID (2 hex chars = 1 byte for single-byte PID)
+        if len(hex_payload) >= 4:
+            # e.g. "0C1234" -> bytes [0x0C, 0x12, 0x34]; data for 0C is 0x12, 0x34
+            data_bytes = data_bytes[1:]  # skip echo of PID
+        value = convert_pid_value(pid, data_bytes)
+        return LivePIDValue(
+            pid=pid,
+            value=value,
+            unit=get_pid_unit(pid),
+            raw_hex=hex_payload,
+        )
+
+    def get_trouble_codes(self) -> List[str]:
+        """Request active trouble codes (Mode 03) and return list of DTC strings."""
+        raw = self.raw_send_receive("0300")
+        cleaned = clean_response(raw, expected_mode="03")
+        if not cleaned:
+            return []
+        return parse_dtc_response(cleaned)
+
+    def clear_trouble_codes(self, confirm: bool = False) -> bool:
+        """
+        Clear DTCs and reset MIL (Mode 04). Safety-protected: requires confirm=True.
+        """
+        if not confirm:
+            return False
+        resp = self.raw_send_receive("04")
+        cleaned = clean_response(resp, expected_mode="04")
+        return "44" in cleaned or "OK" in resp.upper()
+
+    def stream_live_data(
+        self,
+        pids: List[tuple[str, str]],
+        interval_sec: float = 0.5,
+        callback: Optional[Callable[[LivePIDValue], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> Iterator[LivePIDValue]:
+        """
+        Continuously poll the car for the given PIDs and yield (or callback)
+        LivePIDValue for UI updates. Stops when stop_event is set or generator
+        is closed.
+
+        pids: list of (service_mode, pid), e.g. [("01", "0C"), ("01", "0D")]
+        """
+        event = stop_event or threading.Event()
+        while not event.is_set():
+            for mode, pid in pids:
+                if event.is_set():
+                    return
+                try:
+                    result = self.get_pid_value(mode, pid)
+                    if callback:
+                        callback(result)
+                    yield result
+                except Exception:
+                    yield LivePIDValue(pid=pid, value=None, unit=get_pid_unit(pid), raw_hex="")
+            event.wait(interval_sec)
+
+    def start_background_stream(
+        self,
+        pids: List[tuple[str, str]],
+        callback: Callable[[LivePIDValue], None],
+        interval_sec: float = 0.5,
+    ) -> threading.Event:
+        """
+        Start a background thread that runs the data streamer and calls
+        callback for each update. Returns a stop_event; call stop_event.set()
+        to stop the stream.
+        """
+        stop_event = threading.Event()
+        def run() -> None:
+            for _ in self.stream_live_data(pids, interval_sec, callback, stop_event):
+                pass
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return stop_event
+
+
+# =============================================================================
+# Convenience: default PIDs for a typical live dashboard
+# =============================================================================
+
+DEFAULT_LIVE_PIDS: List[tuple[str, str]] = [
+    ("01", "05"),   # Coolant temp
+    ("01", "0C"),   # RPM
+    ("01", "0D"),   # Speed
+    ("01", "0F"),   # Intake air temp
+    ("01", "11"),   # Throttle
+    ("01", "2F"),   # Fuel level
+]
+
+
+def quick_connect(port: Optional[str] = None) -> Optional[OBD2System]:
+    """Create an OBD2System, connect, and return it (or None if connection fails)."""
+    obd = OBD2System(port=port)
+    if obd.connect(port=port):
+        return obd
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Example usage (for SpecForge or standalone)
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # List ports: print(SerialConnection.list_ports())
+    obd = OBD2System(port="COM3")  # or "/dev/ttyUSB0" on Linux
+    if not obd.connect():
+        print("Connection failed")
+        exit(1)
+    # Single read
+    r = obd.get_pid_value("01", "0C")
+    print(f"RPM: {r.value} {r.unit}")
+    # DTCs
+    codes = obd.get_trouble_codes()
+    print("DTCs:", codes)
+    # Live stream (e.g. for UI)
+    stop = obd.start_background_stream(
+        DEFAULT_LIVE_PIDS,
+        callback=lambda v: print(f"{v.pid}: {v.value} {v.unit}"),
+        interval_sec=0.5,
+    )
+    input("Press Enter to stop...")
+    stop.set()
+    obd.disconnect()
+
+# From SpecForge: from OBD_2_SYSTEM_PROJECT import OBD2System, LivePIDValue, DEFAULT_LIVE_PIDS
